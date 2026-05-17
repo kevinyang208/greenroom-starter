@@ -41,19 +41,23 @@ export function CommandPalette({ shows, artists }: Props) {
     function handleKeyDown(e: KeyboardEvent) {
       if ((e.metaKey || e.ctrlKey) && e.key === "k") {
         e.preventDefault();
-        setOpen((prev) => !prev);
+        setOpen((prev) => {
+          const next = !prev;
+          if (next) {
+            setQuery("");
+            setActiveIndex(0);
+          }
+          return next;
+        });
       }
     }
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, []);
 
-  // Focus input when opened, reset state
+  // Focus input when opened.
   useEffect(() => {
     if (open) {
-      setQuery("");
-      setActiveIndex(0);
-      // Small delay so the element is mounted before focusing
       requestAnimationFrame(() => inputRef.current?.focus());
     }
   }, [open]);
@@ -75,11 +79,6 @@ export function CommandPalette({ shows, artists }: Props) {
 
     return [...matchedShows, ...matchedArtists];
   }, [query, shows, artists]);
-
-  // Reset active index when results change
-  useEffect(() => {
-    setActiveIndex(0);
-  }, [results]);
 
   // Navigate to a result
   const navigate = useCallback(
@@ -107,9 +106,10 @@ export function CommandPalette({ shows, artists }: Props) {
       e.preventDefault();
       setActiveIndex((i) => Math.max(i - 1, 0));
     }
-    if (e.key === "Enter" && results[activeIndex]) {
+    const activeResult = results[Math.min(activeIndex, results.length - 1)];
+    if (e.key === "Enter" && activeResult) {
       e.preventDefault();
-      navigate(results[activeIndex]);
+      navigate(activeResult);
     }
   }
 
@@ -167,7 +167,10 @@ export function CommandPalette({ shows, artists }: Props) {
             ref={inputRef}
             type="text"
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              setActiveIndex(0);
+            }}
             placeholder="Search shows and artists..."
             className={cn(
               "flex-1 h-12 text-[16px] text-ink-900 placeholder:text-ink-400",

@@ -2,7 +2,6 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import {
   ArrowLeft,
-  FileWarning,
   ArrowRight,
   Check,
   AlertTriangle,
@@ -11,6 +10,7 @@ import {
   XCircle,
   Wallet,
   TrendingUp,
+  RefreshCw,
 } from "lucide-react";
 import { getShowById } from "@/lib/queries";
 import {
@@ -19,16 +19,25 @@ import {
   CardHeader,
   CardTitle,
   CardDescription,
-  Field,
 } from "@/components/ui/card";
 import { StatusBadge, DealTypeBadge, PlainBadge } from "@/components/ui/badge";
-import { calculateSettlement } from "@/lib/dealMath";
 import {
   formatMoney,
   formatShowDateFull,
 } from "@/lib/format";
 import type { Settlement, Recoup } from "@/db/schema";
 import { Logomark } from "@/components/brand/logo";
+import {
+  calculateConfirmedSettlement,
+  draftStructuredDeal,
+  missingBlockingQuestions,
+  type ConfirmationAnswer,
+  type ConfirmationQuestion,
+  type ConfirmedSettlementCalculation,
+  type DealRisk,
+  type DraftTerm,
+  type StructuredDealDraft,
+} from "@/lib/dealInterpreter";
 
 const RECOUP_LABELS: Record<Recoup["category"], string> = {
   marketing: "Marketing",
@@ -41,10 +50,13 @@ const RECOUP_LABELS: Record<Recoup["category"], string> = {
 
 export default async function SettlePage({
   params,
+  searchParams,
 }: {
   params: Promise<{ id: string }>;
+  searchParams?: Promise<Record<string, string | string[] | undefined>>;
 }) {
   const { id } = await params;
+  const query = searchParams ? await searchParams : {};
   const data = await getShowById(id);
   if (!data) notFound();
 
@@ -62,17 +74,25 @@ export default async function SettlePage({
     );
   }
 
-  const calc = calculateSettlement({
+  const interpreterInput = {
     deal,
     ticketSales,
     expenses,
+    comps: data.comps,
+    recoups,
+    settlement,
     venueCapacity: data.venue?.capacity ?? undefined,
-  });
-  const grossSoFar = ticketSales.reduce((sum, t) => sum + t.gross, 0);
-  const totalFees = ticketSales.reduce((sum, t) => sum + t.fees, 0);
-  const totalExpenses = expenses
-    .filter((e) => !e.absorbedByVenue)
-    .reduce((sum, e) => sum + e.amount, 0);
+  };
+  const interpretationDraft = await draftStructuredDeal(interpreterInput);
+  const confirmationAnswers = confirmationAnswersFromSearchParams(
+    interpretationDraft,
+    query,
+  );
+  const confirmationCalculation = calculateConfirmedSettlement(
+    interpreterInput,
+    interpretationDraft,
+    confirmationAnswers,
+  );
 
   const disputedRecoups = recoups.filter((r) => r.status === "disputed");
   const isDisputed = settlement?.status === "disputed" || settlement?.status === "revised" || !!settlement?.disputedAt;
@@ -127,20 +147,13 @@ export default async function SettlePage({
       )}
 
       <div className="space-y-6 mt-6">
-        {!calc.supported ? (
-          <UnsupportedDeal
-            dealType={calc.dealType}
-            deal={deal}
-            existingSettlement={settlement}
-            grossSoFar={grossSoFar}
-            totalFees={totalFees}
-            totalExpenses={totalExpenses}
-            ticketCount={ticketSales.reduce((s, t) => s + (t.qty ?? 0), 0)}
-            expenseRowCount={expenses.length}
-          />
-        ) : (
-          <SupportedSettlement calc={calc} existingSettlement={settlement} />
-        )}
+        <DealInterpreter
+          showId={show.id}
+          draft={interpretationDraft}
+          answers={confirmationAnswers}
+          calculation={confirmationCalculation}
+          existingSettlement={settlement}
+        />
 
         {recoups.length > 0 && <RecoupsSection recoups={recoups} />}
 
@@ -355,253 +368,572 @@ function LifecycleBar({
   );
 }
 
-function UnsupportedDeal({
-  dealType,
-  deal,
+function DealInterpreter({
+  showId,
+  draft,
+  answers,
+  calculation,
   existingSettlement,
-  grossSoFar,
-  totalFees,
-  totalExpenses,
-  ticketCount,
-  expenseRowCount,
 }: {
-  dealType: string;
-  deal: NonNullable<Awaited<ReturnType<typeof getShowById>>>["deal"];
+  showId: string;
+  draft: StructuredDealDraft;
+  answers: ConfirmationAnswer[];
+  calculation: ConfirmedSettlementCalculation;
   existingSettlement: NonNullable<
     Awaited<ReturnType<typeof getShowById>>
   >["settlement"];
-  grossSoFar: number;
-  totalFees: number;
-  totalExpenses: number;
-  ticketCount: number;
-  expenseRowCount: number;
 }) {
-  const friendly: Record<string, string> = {
-    flat: "flat guarantee",
-    percentage_of_gross: "percentage of gross",
-    percentage_of_net: "percentage of net",
-    vs: "vs deal",
-    door: "door deal",
-  };
+  const missing = missingBlockingQuestions(draft, answers);
+  const answerMap = new Map(answers.map((a) => [a.questionId, a]));
+  const status = interpreterStatus(draft, calculation, missing.length);
 
   return (
     <>
-      <Card accent="amber">
-        <CardContent className="py-12 text-center">
-          <div className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-amber-50 ring-1 ring-amber-200/80 mb-5">
-            <FileWarning className="h-5 w-5 text-amber-700" />
-          </div>
-          <h2 className="font-display text-[22px] font-medium text-ink-900 mb-2" style={{ letterSpacing: "-0.02em" }}>
-            The in-app tool can&apos;t settle a {friendly[dealType] ?? dealType} yet.
-          </h2>
-          <p className="text-[13px] text-ink-500 max-w-md mx-auto leading-relaxed">
-            Mariana would do this on a Google Sheet at 2am tonight. The inputs
-            are below — but the math doesn&apos;t happen here.
-          </p>
-        </CardContent>
-      </Card>
-
-      <Card>
+      <Card accent={status.accent}>
         <CardHeader>
           <div>
-            <CardTitle>What the system has</CardTitle>
+            <div className="flex items-center gap-2">
+              <CardTitle>Deal Interpreter</CardTitle>
+              <PlainBadge variant={status.badge}>{status.label}</PlainBadge>
+            </div>
             <CardDescription>
-              The inputs Mariana would pull together to settle this show.
-              They&apos;re here — but disconnected from the deal terms.
+              Greenroom interpreted the deal prose, checks what needs
+              confirmation, and only calculates from confirmed terms.
             </CardDescription>
           </div>
+          <Link
+            href={`/shows/${showId}/settle`}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-ink-200/80 bg-white px-3 py-2 text-[12px] font-medium text-ink-700 hover:bg-ink-50"
+          >
+            <RefreshCw className="h-3.5 w-3.5" />
+            Reset demo
+          </Link>
         </CardHeader>
-        <CardContent>
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-5">
-            <Field
-              label="Gross box office"
-              mono
-              value={formatMoney(grossSoFar)}
-            />
-            <Field label="Fees" mono value={formatMoney(totalFees)} />
-            <Field
-              label="Net box office"
-              mono
-              value={formatMoney(grossSoFar - totalFees)}
-            />
-          </div>
+        <CardContent className="space-y-7">
+          <InterpreterSummary
+            draft={draft}
+            calculation={calculation}
+            existingSettlement={existingSettlement}
+          />
 
-          <div className="mt-6 grid grid-cols-1 sm:grid-cols-3 gap-5">
-            <Field label="Tickets sold" mono value={String(ticketCount)} />
-            <Field
-              label="Expenses (line items)"
-              mono
-              value={String(expenseRowCount)}
+          <section>
+            <SectionTitle
+              title="Interpreted deal terms"
+              description={`${draft.extractorMode === "llm" ? "LLM" : "Local fallback"} extraction · source hash ${draft.sourceHash.slice(0, 8)}`}
             />
-            <Field
-              label="Expenses (passed through)"
-              mono
-              value={formatMoney(totalExpenses)}
-            />
-          </div>
-
-          {deal?.dealNotesFreetext && (
-            <div className="mt-6">
-              <div className="eyebrow text-[10px] text-ink-500 mb-2">
-                Deal notes (free text — what Mariana actually trusts)
-              </div>
-              <div className="text-[12.5px] text-ink-800 bg-canvas-soft rounded-lg p-4 ring-1 ring-ink-200/60 leading-relaxed">
-                {deal.dealNotesFreetext}
-              </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {draft.terms.map((term) => (
+                <TermRow key={term.id} term={term} />
+              ))}
             </div>
+          </section>
+
+          {draft.confirmationQuestions.length > 0 && (
+            <section>
+              <SectionTitle
+                title="Confirm assumptions"
+                description="Only payout-impacting ambiguity is asked here. Answers stay in the URL for this demo; no database writes."
+              />
+              <div className="space-y-3">
+                {draft.confirmationQuestions.map((question) => (
+                  <ConfirmationQuestionCard
+                    key={question.id}
+                    showId={showId}
+                    question={question}
+                    answer={answerMap.get(question.id)}
+                    answers={answers}
+                  />
+                ))}
+              </div>
+            </section>
           )}
+
+          {draft.risks.length > 0 && (
+            <section>
+              <SectionTitle
+                title="Risk flags"
+                description="These stay visible even when the worksheet can calculate."
+              />
+              <div className="space-y-2">
+                {draft.risks.map((risk) => (
+                  <RiskRow key={risk.id} risk={risk} />
+                ))}
+              </div>
+            </section>
+          )}
+
+          <section>
+            <SectionTitle
+              title="Settlement worksheet"
+              description="Deterministic math from confirmed structured terms only."
+            />
+            <Worksheet calculation={calculation} />
+          </section>
         </CardContent>
       </Card>
 
-      {existingSettlement?.totalToArtist != null && (
-        <Card
-          accent={existingSettlement.status === "disputed" ? "rose" : "brand"}
-        >
-          <CardHeader>
-            <div>
-              <CardTitle>Actually settled (off-platform)</CardTitle>
+      {calculation.status === "ready" &&
+        calculation.bonusesNotTriggered.length > 0 && (
+          <Card>
+            <CardHeader>
+              <CardTitle>Bonuses not triggered</CardTitle>
               <CardDescription>
-                Mariana ran this in a spreadsheet. Here&apos;s the result that
-                was logged back into Greenroom afterward.
+                Structured bonuses captured by the interpreter that did not
+                hit. Shown for transparency.
               </CardDescription>
-            </div>
-            {existingSettlement.status === "disputed" ? (
-              <PlainBadge variant="rose">Disputed</PlainBadge>
-            ) : (
-              <PlainBadge variant="brand">Signed</PlainBadge>
-            )}
-          </CardHeader>
-          <CardContent>
-            <div className="flex items-baseline justify-between py-2">
-              <span className="text-[13px] text-ink-600">Total to artist</span>
-              <span className="text-[32px] font-mono tabular font-semibold text-ink-900" style={{ letterSpacing: "-0.02em" }}>
-                {formatMoney(existingSettlement.totalToArtist)}
-              </span>
-            </div>
-          </CardContent>
-        </Card>
+            </CardHeader>
+            <CardContent className="divide-y divide-ink-100/80">
+              {calculation.bonusesNotTriggered.map((b, i) => (
+                <div
+                  key={i}
+                  className="py-3 flex items-baseline justify-between gap-4"
+                >
+                  <div className="min-w-0">
+                    <div className="text-[13px] text-ink-600">{b.label}</div>
+                    <div className="text-[11.5px] text-ink-400 mt-0.5">
+                      {b.reason}
+                    </div>
+                  </div>
+                  <div className="text-[12.5px] text-ink-300 font-mono tabular line-through">
+                    {formatMoney(b.amount)}
+                  </div>
+                </div>
+              ))}
+            </CardContent>
+          </Card>
       )}
     </>
   );
 }
 
-function SupportedSettlement({
-  calc,
+function InterpreterSummary({
+  draft,
+  calculation,
   existingSettlement,
 }: {
-  calc: Extract<
-    ReturnType<typeof calculateSettlement>,
-    { supported: true }
-  >;
+  draft: StructuredDealDraft;
+  calculation: ConfirmedSettlementCalculation;
   existingSettlement: NonNullable<
     Awaited<ReturnType<typeof getShowById>>
   >["settlement"];
 }) {
+  if (calculation.status !== "ready") {
+    return (
+      <div className="rounded-lg border border-amber-200/60 bg-amber-50/40 p-5 flex gap-3">
+        <AlertTriangle className="h-4 w-4 text-amber-700 mt-0.5 shrink-0" />
+        <div>
+          <div className="text-[13px] font-semibold text-amber-900">
+            Calculation locked
+          </div>
+          <p className="text-[12.5px] text-ink-700 mt-1 leading-relaxed">
+            {calculation.reason}
+          </p>
+          <p className="text-[11.5px] text-ink-500 mt-2">
+            The final artist payout is hidden until the workflow can produce
+            an auditable number.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <>
-      {/* Hero number */}
-      <div className="text-center py-10 mb-2">
-        <div className="eyebrow text-[10px] text-ink-400 mb-3">Total to artist</div>
+    <div className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-6 items-center rounded-lg bg-gradient-paper ring-1 ring-brand-200/60 p-6">
+      <div>
+        <div className="eyebrow text-[10px] text-brand-700 mb-2">
+          Authoritative payout
+        </div>
         <div
-          className="text-[72px] font-mono tabular font-bold text-ink-900 leading-none"
+          className="text-[56px] font-mono tabular font-bold text-ink-900 leading-none"
           style={{ letterSpacing: "-0.03em" }}
         >
-          {formatMoney(calc.totalToArtist)}
+          {formatMoney(calculation.totalToArtist)}
         </div>
-        {existingSettlement && (
-          <div className="mt-3">
-            {existingSettlement.status === "paid" ? (
-              <PlainBadge variant="brand">Paid</PlainBadge>
-            ) : existingSettlement.status === "signed" ||
-              existingSettlement.status === "finalized" ? (
-              <PlainBadge variant="brand">Signed</PlainBadge>
-            ) : existingSettlement.status === "disputed" ? (
-              <PlainBadge variant="rose">Disputed</PlainBadge>
-            ) : null}
-          </div>
-        )}
+        <div className="text-[12px] text-ink-500 mt-2 font-mono">
+          {calculation.finalFormula}
+        </div>
         {existingSettlement?.totalToArtist != null &&
-          existingSettlement.totalToArtist !== calc.totalToArtist && (
-          <div className="text-[12px] text-ink-400 mt-2">
-            Originally settled at{" "}
-            <span className="font-mono tabular text-ink-600">
-              {formatMoney(existingSettlement.totalToArtist)}
-            </span>
-          </div>
+          existingSettlement.totalToArtist !== calculation.totalToArtist && (
+            <div className="text-[12px] text-ink-400 mt-2">
+              Logged settlement:{" "}
+              <span className="font-mono tabular text-ink-700">
+                {formatMoney(existingSettlement.totalToArtist)}
+              </span>
+            </div>
+          )}
+      </div>
+      <div className="flex flex-col gap-2 md:items-end">
+        <PlainBadge variant={draft.risks.length > 0 ? "amber" : "brand"}>
+          {draft.risks.length > 0 ? "Calculated with flags" : "Ready to calculate"}
+        </PlainBadge>
+        {existingSettlement?.status && (
+          <PlainBadge variant={existingSettlement.status === "disputed" ? "rose" : "default"}>
+            Existing status: {existingSettlement.status.replace(/_/g, " ")}
+          </PlainBadge>
         )}
       </div>
-
-      {/* Worksheet breakdown */}
-      <Card accent="brand">
-        <CardHeader>
-          <div>
-            <CardTitle>Settlement worksheet</CardTitle>
-            <CardDescription className="font-mono">
-              {calc.finalFormula}
-            </CardDescription>
-          </div>
-        </CardHeader>
-        <CardContent className="divide-y divide-ink-100/80">
-          <Row
-            label="Gross box office"
-            value={formatMoney(calc.grossBoxOffice)}
-          />
-          <Row label="Net box office" value={formatMoney(calc.netBoxOffice)} />
-          <Row
-            label="Total expenses (passed through)"
-            value={formatMoney(calc.totalExpenses)}
-          />
-          <div className="pt-3" />
-          {calc.steps.map((step, i) => (
-            <Row
-              key={i}
-              label={step.label}
-              value={formatMoney(step.value)}
-              note={step.note}
-            />
-          ))}
-          <div className="pt-3" />
-          <div className="flex items-baseline justify-between py-3 font-semibold">
-            <span className="text-[13px] text-ink-900">Total to artist</span>
-            <span className="text-[18px] font-mono tabular text-ink-900">
-              {formatMoney(calc.totalToArtist)}
-            </span>
-          </div>
-        </CardContent>
-      </Card>
-
-      {calc.bonusesNotTriggered.length > 0 && (
-        <Card>
-          <CardHeader>
-            <CardTitle>Bonuses not triggered</CardTitle>
-            <CardDescription>
-              Structured bonuses on this deal that didn&apos;t hit. Shown for
-              transparency — useful when the agent asks &quot;what about that
-              gross threshold bonus?&quot;
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="divide-y divide-ink-100/80">
-            {calc.bonusesNotTriggered.map((b, i) => (
-              <div
-                key={i}
-                className="py-3 flex items-baseline justify-between gap-4"
-              >
-                <div className="min-w-0">
-                  <div className="text-[13px] text-ink-600">{b.label}</div>
-                  <div className="text-[11.5px] text-ink-400 mt-0.5">
-                    {b.reason}
-                  </div>
-                </div>
-                <div className="text-[12.5px] text-ink-300 font-mono tabular line-through">
-                  {formatMoney(b.amount)}
-                </div>
-              </div>
-            ))}
-          </CardContent>
-        </Card>
-      )}
-    </>
+    </div>
   );
+}
+
+function SectionTitle({
+  title,
+  description,
+}: {
+  title: string;
+  description: string;
+}) {
+  return (
+    <div className="mb-3">
+      <div className="text-[13px] font-semibold text-ink-900">{title}</div>
+      <div className="text-[12px] text-ink-500 mt-0.5 leading-relaxed">
+        {description}
+      </div>
+    </div>
+  );
+}
+
+function TermRow({ term }: { term: DraftTerm }) {
+  const badge = termStatusBadge(term.status);
+  return (
+    <div className="rounded-lg border border-ink-200/70 bg-canvas-soft px-4 py-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-[11px] font-medium text-ink-400 uppercase tracking-[0.08em]">
+            {term.label}
+          </div>
+          <div className="text-[13.5px] font-medium text-ink-900 mt-1">
+            {term.value}
+          </div>
+        </div>
+        <PlainBadge variant={badge.variant}>{badge.label}</PlainBadge>
+      </div>
+      {term.sourceText && (
+        <div className="text-[11.5px] text-ink-500 mt-2 leading-snug">
+          Source: &ldquo;{term.sourceText}&rdquo;
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ConfirmationQuestionCard({
+  showId,
+  question,
+  answer,
+  answers,
+}: {
+  showId: string;
+  question: ConfirmationQuestion;
+  answer?: ConfirmationAnswer;
+  answers: ConfirmationAnswer[];
+}) {
+  const isAnswered = !!answer && answer.selectedValue !== "ask_agent";
+  return (
+    <form
+      action={`/shows/${showId}/settle`}
+      method="get"
+      className={`rounded-lg border p-4 ${
+        isAnswered
+          ? "border-brand-200/70 bg-brand-50/20"
+          : "border-amber-200/70 bg-amber-50/30"
+      }`}
+    >
+      {answers
+        .filter((savedAnswer) => savedAnswer.questionId !== question.id)
+        .map((savedAnswer) => (
+          <input
+            key={savedAnswer.questionId}
+            type="hidden"
+            name={`confirm:${savedAnswer.questionId}`}
+            value={savedAnswer.selectedValue}
+          />
+        ))}
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-2">
+            <div className="text-[13px] font-semibold text-ink-900">
+              {question.question}
+            </div>
+            <PlainBadge variant={question.severity === "blocking" ? "amber" : "default"}>
+              {question.severity === "blocking" ? "Blocks calculation" : "Review"}
+            </PlainBadge>
+          </div>
+          {question.sourceText && (
+            <div className="text-[11.5px] text-ink-500 mt-1.5 leading-snug">
+              Source: &ldquo;{question.sourceText}&rdquo;
+            </div>
+          )}
+          <div className="text-[12px] text-ink-600 mt-2 leading-relaxed">
+            {question.whyItMatters}
+          </div>
+          {question.payoutImpactCents != null && question.payoutImpactCents > 0 && (
+            <div className="text-[12px] text-amber-800 mt-2 font-medium">
+              Estimated payout impact: {formatMoney(question.payoutImpactCents / 100)}
+            </div>
+          )}
+          {answer && (
+            <div className="text-[11.5px] text-brand-800 mt-2">
+              Selected answer: {answer.selectedLabel}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-2 mt-4">
+        {question.options.map((option) => (
+          <label
+            key={option.value}
+            className={`rounded-lg border bg-white px-3 py-3 cursor-pointer transition-colors ${
+              answer?.selectedValue === option.value
+                ? "border-brand-500 ring-1 ring-brand-500"
+                : "border-ink-200/80 hover:border-ink-300"
+            }`}
+          >
+            <div className="flex items-start gap-2">
+              <input
+                type="radio"
+                name={`confirm:${question.id}`}
+                value={option.value}
+                defaultChecked={answer?.selectedValue === option.value}
+                required
+                className="mt-0.5"
+              />
+              <div>
+                <div className="text-[12.5px] font-medium text-ink-900 leading-tight">
+                  {option.label}
+                </div>
+                {option.description && (
+                  <div className="text-[11.5px] text-ink-500 mt-1 leading-snug">
+                    {option.description}
+                  </div>
+                )}
+              </div>
+            </div>
+          </label>
+        ))}
+      </div>
+
+      <div className="mt-3 flex justify-end">
+        <button
+          type="submit"
+          className="inline-flex items-center gap-1.5 rounded-lg bg-ink-900 px-3 py-2 text-[12px] font-medium text-white hover:bg-ink-800"
+        >
+          <Check className="h-3.5 w-3.5" />
+          Apply confirmation
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function confirmationAnswersFromSearchParams(
+  draft: StructuredDealDraft,
+  query: Record<string, string | string[] | undefined>,
+): ConfirmationAnswer[] {
+  return draft.confirmationQuestions.flatMap((question) => {
+    const rawValue = query[`confirm:${question.id}`];
+    const selectedValue = Array.isArray(rawValue)
+      ? rawValue.at(-1)
+      : rawValue;
+    const option = question.options.find((o) => o.value === selectedValue);
+
+    if (!selectedValue || !option) return [];
+
+    return [
+      {
+        questionId: question.id,
+        selectedValue,
+        selectedLabel: option.label,
+      },
+    ];
+  });
+}
+
+function RiskRow({ risk }: { risk: DealRisk }) {
+  const variant =
+    risk.severity === "blocking"
+      ? "rose"
+      : risk.severity === "warning"
+        ? "amber"
+        : "default";
+  return (
+    <div className="rounded-lg border border-ink-200/70 bg-white px-4 py-3 flex items-start gap-3">
+      <AlertTriangle
+        className={`h-4 w-4 mt-0.5 ${
+          risk.severity === "blocking"
+            ? "text-rose-700"
+            : risk.severity === "warning"
+              ? "text-amber-700"
+              : "text-ink-400"
+        }`}
+      />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <div className="text-[13px] font-medium text-ink-900">
+            {risk.label}
+          </div>
+          <PlainBadge variant={variant}>{risk.severity}</PlainBadge>
+        </div>
+        <div className="text-[12px] text-ink-600 mt-1 leading-relaxed">
+          {risk.detail}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Worksheet({
+  calculation,
+}: {
+  calculation: ConfirmedSettlementCalculation;
+}) {
+  if (calculation.status === "locked") {
+    return (
+      <div className="rounded-lg border border-amber-200/70 bg-amber-50/30 p-5">
+        <div className="text-[13px] font-semibold text-amber-900">
+          Worksheet locked
+        </div>
+        <p className="text-[12px] text-ink-600 mt-1 leading-relaxed">
+          {calculation.reason}
+        </p>
+      </div>
+    );
+  }
+
+  if (calculation.status === "unsupported") {
+    return (
+      <div className="rounded-lg border border-ink-200/70 bg-canvas-soft p-5">
+        <div className="text-[13px] font-semibold text-ink-900">
+          Formula captured, not auto-calculated
+        </div>
+        <p className="text-[12px] text-ink-600 mt-1 leading-relaxed">
+          {calculation.reason}
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-lg border border-ink-200/70 bg-white overflow-hidden">
+      {calculation.comparison && (
+        <div className="grid grid-cols-3 gap-px bg-ink-100/80 border-b border-ink-100/80">
+          <ComparisonCell
+            label="Guarantee side"
+            value={calculation.comparison.guarantee}
+            active={calculation.comparison.winner === "guarantee"}
+          />
+          <ComparisonCell
+            label="Percentage side"
+            value={calculation.comparison.percentagePayout}
+            active={calculation.comparison.winner === "percentage"}
+          />
+          <div className="bg-brand-50 px-4 py-3">
+            <div className="eyebrow text-[9px] text-brand-800">Winner</div>
+            <div className="text-[14px] font-semibold text-brand-900 mt-1 capitalize">
+              {calculation.comparison.winner} side
+            </div>
+          </div>
+        </div>
+      )}
+      <div className="divide-y divide-ink-100/80 px-5 py-3">
+        <Row label="Gross box office" value={formatMoney(calculation.grossBoxOffice)} />
+        <Row label="Net box office" value={formatMoney(calculation.netBoxOffice)} />
+        <Row
+          label="Expenses entered"
+          value={formatMoney(calculation.totalExpenses)}
+        />
+        {calculation.steps.map((step, i) => (
+          <Row
+            key={`${step.label}-${i}`}
+            label={step.label}
+            value={formatMoney(step.value)}
+            note={step.note}
+          />
+        ))}
+        <div className="flex items-baseline justify-between py-3 font-semibold">
+          <span className="text-[13px] text-ink-900">Total to artist</span>
+          <span className="text-[18px] font-mono tabular text-ink-900">
+            {formatMoney(calculation.totalToArtist)}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ComparisonCell({
+  label,
+  value,
+  active,
+}: {
+  label: string;
+  value: number;
+  active: boolean;
+}) {
+  return (
+    <div className={`px-4 py-3 ${active ? "bg-brand-50" : "bg-white"}`}>
+      <div className={`eyebrow text-[9px] ${active ? "text-brand-800" : "text-ink-400"}`}>
+        {label}
+      </div>
+      <div className="text-[17px] font-mono tabular font-semibold text-ink-900 mt-1">
+        {formatMoney(value)}
+      </div>
+    </div>
+  );
+}
+
+function interpreterStatus(
+  draft: StructuredDealDraft,
+  calculation: ConfirmedSettlementCalculation,
+  missingCount: number,
+): {
+  label: string;
+  badge: "default" | "amber" | "brand" | "rose" | "sky";
+  accent: "brand" | "amber" | "rose" | "sky";
+} {
+  if (missingCount > 0 || calculation.status === "locked") {
+    return {
+      label: `Needs ${Math.max(missingCount, 1)} confirmation${Math.max(missingCount, 1) === 1 ? "" : "s"}`,
+      badge: "amber",
+      accent: "amber",
+    };
+  }
+  if (calculation.status === "unsupported") {
+    return {
+      label: "Unsupported formula captured",
+      badge: "default",
+      accent: "sky",
+    };
+  }
+  if (draft.risks.length > 0) {
+    return {
+      label: "Risk flagged after sign-off",
+      badge: "amber",
+      accent: "amber",
+    };
+  }
+  return {
+    label: "Ready to calculate",
+    badge: "brand",
+    accent: "brand",
+  };
+}
+
+function termStatusBadge(status: DraftTerm["status"]): {
+  label: string;
+  variant: "default" | "amber" | "brand" | "rose" | "sky";
+} {
+  const map: Record<
+    DraftTerm["status"],
+    { label: string; variant: "default" | "amber" | "brand" | "rose" | "sky" }
+  > = {
+    confirmed: { label: "Confirmed", variant: "brand" },
+    inferred: { label: "Inferred", variant: "sky" },
+    needs_confirmation: { label: "Needs confirmation", variant: "amber" },
+    unsupported: { label: "Captured", variant: "default" },
+  };
+  return map[status];
 }
 
 function RecoupsSection({ recoups }: { recoups: Recoup[] }) {
