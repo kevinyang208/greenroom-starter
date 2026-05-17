@@ -837,12 +837,6 @@ function Worksheet({
         </div>
       )}
       <div className="divide-y divide-ink-100/80 px-5 py-3">
-        <Row label="Gross box office" value={formatMoney(calculation.grossBoxOffice)} />
-        <Row label="Net box office" value={formatMoney(calculation.netBoxOffice)} />
-        <Row
-          label="Expenses entered"
-          value={formatMoney(calculation.totalExpenses)}
-        />
         {calculation.steps.map((step, i) => (
           <Row
             key={`${step.label}-${i}`}
